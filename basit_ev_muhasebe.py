@@ -413,7 +413,10 @@ class AccountingDemo:
                     self.cover_photo = ImageTk.PhotoImage(source.convert("RGB"))
             except (OSError, tk.TclError):
                 self.cover_photo = None
-        self.root.state("zoomed")
+        if self.root.tk.call("tk", "windowingsystem") == "x11":
+            self.root.attributes("-zoomed", True)
+        else:
+            self.root.state("zoomed")
         self.root.resizable(True, True)
         self.root.update_idletasks()
         width, height = self.root.winfo_width(), self.root.winfo_height()
