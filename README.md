@@ -12,7 +12,7 @@ Windows'ta Python kurmadan kullanmak için [V2 Windows taşınabilir sürümün�
 
 [Linux taşınabilir paketini indir](https://github.com/sarmasaicode/basit-ev-muhasebe/releases/download/v2.0.0-beta.2/Basit-Ev-Muhasebe-Linux-v2.0.0-beta.2.zip). ZIP'i yazma izniniz olan bir klasöre çıkartın ve **CALISTIR_LINUX.sh** dosyasını çalıştırın. Dosya yöneticisi çalıştırmayı engellerse terminalde **./CALISTIR_LINUX.sh** komutunu kullanın.
 
-Bu paket Ubuntu 22.04 x86_64 üzerinde derlendi; farklı Linux dağıtımlarında ve masaüstlerinde çalışması doğrulanmadı. İlk açılışta kendi kullanıcı hesabınızı oluşturun. Veriler, çalıştırılan programın yanındaki **veriler/** klasörüne yazılır. PDF raporları kaydedilir; fiziksel yazdırma için PDF görüntüleyicisini kullanın. Bu beta paket Linux ortamında açılarak denenmemiştir.
+Bu paket Ubuntu 22.04 x86_64 üzerinde derlendi. Açılışı CachyOS x86_64 üzerinde doğrulandı. İlk açılışta kendi kullanıcı hesabınızı oluşturun. Veriler, çalıştırılan programın yanındaki **veriler/** klasörüne yazılır. PDF raporları kaydedilir; fiziksel yazdırma için PDF görüntüleyicisini kullanın.
 
 **Not:** Yayın sayfasındaki “Source code” dosyaları Linux uygulama paketi değildir.
 
