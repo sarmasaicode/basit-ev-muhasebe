@@ -1,0 +1,88 @@
+name: Build Linux portable release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing GitHub release tag to attach the Linux package to
+        required: true
+        default: v2.0.0-beta.1
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Check out selected release source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_tag }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install build and application dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-tk
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Build portable Linux application
+        run: |
+          pyinstaller --noconfirm --clean --onefile --windowed \
+            --name "Basit-Ev-Muhasebe" \
+            --collect-all reportlab \
+            basit_ev_muhasebe.py
+
+      - name: Prepare Linux package
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          mkdir -p package
+          cp dist/Basit-Ev-Muhasebe package/
+          cat > package/CALISTIR_LINUX.sh <<'EOF'
+          #!/bin/sh
+          set -eu
+          cd "$(dirname "$0")"
+          exec ./Basit-Ev-Muhasebe
+          EOF
+          chmod +x package/CALISTIR_LINUX.sh package/Basit-Ev-Muhasebe
+          cat > package/BILGI_LINUX.txt <<EOF
+          BASIT EV MUHASEBE — LINUX TASINABILIR SURUM
+          Surum kaynagi: ${RELEASE_TAG}
+
+          KURULUM
+          1. ZIP arsivini yazma izniniz olan bir klasore cikartin (ornegin Ev dizininiz).
+          2. CALISTIR_LINUX.sh dosyasina cift tiklayin.
+             Dosya yoneticisi calistirma secenegi sunmazsa terminalde bu klasore girip:
+             ./CALISTIR_LINUX.sh
+             komutunu calistirin.
+          3. Ilk acilista kendi kullanici hesabinizi ve sifrenizi olusturun.
+
+          VERI VE YEDEK
+          Uygulama kayitlari, calistirilan dosyanin yanindaki veriler/ klasorunde olusur.
+          Uygulamayi salt okunur bir klasorden calistirmayin.
+          Klasoru tasirken veriler/ klasorunu ve yedeklerinizi birlikte tasiyin.
+          Bu paket temiz baslar ve kullanici verisi icermez.
+
+          LINUX NOTU
+          Bu paket x86_64 Ubuntu 22.04 uzerinde derlenmistir. Linux dagitimlari ve
+          masaustu ortamlarinda test edilmemistir. Grafik arayuzu icin X11/Wayland,
+          Tcl/Tk ve sistemin gerekli grafik kitapliklari gerekebilir.
+          Fiziksel yazdirma yerine raporlar PDF olarak kaydedilir.
+          EOF
+          zip -9 -j "Basit-Ev-Muhasebe-Linux-${RELEASE_TAG}.zip" package/Basit-Ev-Muhasebe package/CALISTIR_LINUX.sh package/BILGI_LINUX.txt
+
+      - name: Attach Linux package to the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: gh release upload "$RELEASE_TAG" "Basit-Ev-Muhasebe-Linux-$RELEASE_TAG.zip" --clobber
