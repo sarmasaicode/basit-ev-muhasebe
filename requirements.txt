@@ -1,0 +1,5 @@
+Pillow>=10.0,<12
+cryptography>=42,<47
+reportlab>=4.0,<5
+pyinstaller>=6.0,<7
+
