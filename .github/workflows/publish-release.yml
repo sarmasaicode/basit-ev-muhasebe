@@ -1,0 +1,144 @@
+name: Build and publish Windows and Linux releases
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing version tag to build and publish
+        required: true
+        default: v3.0.0
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - name: Check out release source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref }}
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Build portable Windows application
+        run: pyinstaller --noconfirm --clean --onedir --windowed --name CALISTIR --contents-directory . basit_ev_muhasebe.py
+      - name: Prepare Windows ZIP
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
+        run: |
+          $package = Join-Path $env:RUNNER_TEMP "windows-package"
+          New-Item -ItemType Directory -Path $package | Out-Null
+          Copy-Item -LiteralPath "dist\CALISTIR" -Destination (Join-Path $package "CALISTIR") -Recurse
+          Copy-Item -LiteralPath "KISAYOL_OLUSTUR.vbs" -Destination $package
+          @"
+          BASIT EV MUHASEBE V3 — WINDOWS TASINABILIR SURUM
+          Surum: $env:RELEASE_TAG
+
+          ZIP dosyasini tamamen ve yazma izni olan bir klasore cikartin.
+          CALISTIR\CALISTIR.exe dosyasini acin. Masaustu kisayolu icin KISAYOL_OLUSTUR.vbs dosyasina tiklayin.
+          Ilk acilista yonetici hesabinizi olusturun. Ayarlar'dan en fazla 5 ek kullanici ve yetkileri tanimlayabilirsiniz.
+          Kayitlar uygulama klasorunun yanindaki veriler\ klasorunde tutulur. Paket sifir kullanici verisiyle baslar.
+          Programi yazma izni olmayan Program Files gibi klasorlerden calistirmayin.
+          "@ | Set-Content -LiteralPath (Join-Path $package "BILGI.txt") -Encoding utf8
+          Compress-Archive -Path (Join-Path $package "*") -DestinationPath "Basit-Ev-Muhasebe-WINDOWS-$env:RELEASE_TAG.zip" -CompressionLevel Optimal
+      - name: Upload Windows package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-package
+          path: Basit-Ev-Muhasebe-WINDOWS-${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}.zip
+          if-no-files-found: error
+
+  linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Check out release source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref }}
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements.txt
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-tk zip
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+      - name: Build portable Linux application
+        run: pyinstaller --noconfirm --clean --onefile --windowed --name Basit-Ev-Muhasebe --collect-all reportlab basit_ev_muhasebe.py
+      - name: Prepare Linux ZIP
+        env:
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
+        run: |
+          mkdir -p package
+          cp dist/Basit-Ev-Muhasebe package/
+          cat > package/CALISTIR_LINUX.sh <<'EOF'
+          #!/bin/sh
+          set -eu
+          cd "$(dirname "$0")"
+          exec ./Basit-Ev-Muhasebe
+          EOF
+          chmod +x package/CALISTIR_LINUX.sh package/Basit-Ev-Muhasebe
+          cat > package/BILGI_LINUX.txt <<EOF
+          BASIT EV MUHASEBE V3 — LINUX TASINABILIR SURUM
+          Surum: ${RELEASE_TAG}
+
+          ZIP arsivini yazma izniniz olan bir klasore tamamen cikartin ve CALISTIR_LINUX.sh dosyasini calistirin.
+          Ilk acilista yonetici hesabinizi olusturun. Ayarlar'dan en fazla 5 ek kullanici ve yetkileri tanimlayabilirsiniz.
+          Kayitlar uygulamanin yanindaki veriler/ klasorunde tutulur. Paket sifir kullanici verisiyle baslar.
+          Bu paket Ubuntu 22.04 x86_64 uzerinde derlenmistir. Diger Linux dagitimlarinda grafik kutuphaneleri gerekebilir.
+          EOF
+          zip -9 -j "Basit-Ev-Muhasebe-LINUX-${RELEASE_TAG}.zip" package/Basit-Ev-Muhasebe package/CALISTIR_LINUX.sh package/BILGI_LINUX.txt
+      - name: Upload Linux package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-package
+          path: Basit-Ev-Muhasebe-LINUX-${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}.zip
+          if-no-files-found: error
+
+  publish:
+    runs-on: ubuntu-latest
+    needs: [windows, linux]
+    steps:
+      - name: Download Windows package
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-package
+          path: packages
+      - name: Download Linux package
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-package
+          path: packages
+      - name: Publish release and retire incomplete beta downloads
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
+        run: |
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" packages/*.zip --clobber
+            gh release edit "$RELEASE_TAG" --title "BASIT EV MUHASEBE $RELEASE_TAG — WINDOWS & LINUX" --notes-file RELEASE_NOTES_v3.0.0.md --latest
+          else
+            gh release create "$RELEASE_TAG" packages/*.zip --title "BASIT EV MUHASEBE $RELEASE_TAG — WINDOWS & LINUX" --notes-file RELEASE_NOTES_v3.0.0.md --latest
+          fi
+          for old_tag in v2.0.0-beta.1 v2.0.0-beta.2; do
+            if gh release view "$old_tag" >/dev/null 2>&1; then
+              gh release delete "$old_tag" --yes --cleanup-tag
+            fi
+          done
+
