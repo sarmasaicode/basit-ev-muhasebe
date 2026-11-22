@@ -8,6 +8,7 @@ import base64
 import ctypes
 import json
 import os
+import queue
 import re
 import secrets
 import subprocess
@@ -17,6 +18,8 @@ import threading
 import time
 import uuid
 import urllib.parse
+import urllib.request
+import urllib.error
 import webbrowser
 import zipfile
 from datetime import datetime, timedelta
@@ -28,9 +31,10 @@ from PIL import Image, ImageTk
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.exceptions import InvalidTag
 
-APP_VERSION = "2.0.0-portable-clean-secure"
+APP_VERSION = "3.0.0"
 DATA_SCHEMA = 1
 PBKDF2_ROUNDS = 310_000
+LATEST_RELEASE_API = "https://api.github.com/repos/sarmasaicode/basit-ev-muhasebe/releases/latest"
 
 # When packaged as an EXE, keep all files beside the EXE (for USB portability).
 APP_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
@@ -39,6 +43,59 @@ IMAGE_DIR = APP_DIR / "gorseller"
 ACCOUNT_FILE = DATA_DIR / "kullanici.json"
 BOOKS_FILE = DATA_DIR / "muhasebe_verileri.json"
 SETTINGS_FILE = DATA_DIR / "ayarlar.json"
+
+
+_NATIVE_TK_BUTTON = tk.Button
+
+
+class StandardTkButton(_NATIVE_TK_BUTTON):
+    """Shared compact button system; calendar controls keep their grid dimensions."""
+
+    def __init__(self, master=None, **kwargs):
+        label = str(kwargs.get("text", ""))
+        calendar_control = label in {"‹", "›", "📅"} or label.isdigit()
+        if calendar_control:
+            kwargs.update({
+                "bg": "#e9f0f8", "fg": "#17365c", "activebackground": "#d9e7f6",
+                "activeforeground": "#17365c", "relief": "flat", "bd": 0,
+                "highlightthickness": 0, "font": ("Segoe UI", 9, "bold"),
+                "cursor": "hand2", "padx": 3, "pady": 3,
+            })
+            super().__init__(master, **kwargs)
+            self._standard_spacing = False
+            return
+
+        folded_label = label.casefold()
+        destructive = any(word in folded_label for word in ("sil", "silme", "sıfırla", "ödenmedi"))
+        paid_action = "ödendi" in folded_label and "ödenmedi" not in folded_label
+        background = "#c9434d" if destructive else ("#16834a" if paid_action else "#0756bd")
+        hover = "#ab3039" if destructive else ("#116c3c" if paid_action else "#06489e")
+        kwargs.update({
+            "bg": background, "fg": "#ffffff", "activebackground": hover,
+            "activeforeground": "#ffffff", "disabledforeground": "#d4deeb",
+            "relief": "flat", "bd": 0, "highlightthickness": 0,
+            "overrelief": "flat", "font": ("Segoe UI", 10, "bold"),
+            "width": 16, "height": 2, "wraplength": 126,
+            "justify": "center", "anchor": "center", "padx": 8, "pady": 5,
+            "cursor": "hand2",
+        })
+        super().__init__(master, **kwargs)
+        self._standard_spacing = True
+
+    def pack(self, *args, **kwargs):
+        if self._standard_spacing:
+            kwargs["padx"] = 4
+            kwargs["pady"] = 3
+        return super().pack(*args, **kwargs)
+
+    def grid(self, *args, **kwargs):
+        if self._standard_spacing:
+            kwargs["padx"] = 4
+            kwargs["pady"] = 3
+        return super().grid(*args, **kwargs)
+
+
+tk.Button = StandardTkButton
 
 
 ACTIVE_DATA_KEY: bytes | None = None
@@ -245,16 +302,27 @@ def ensure_data_file() -> None:
 class AccountingDemo:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
-        self.root.title("Basit Ev Muhasebe Programı")
+        self.root.title("Gelir-Gider Takibi")
         self.root.configure(bg="#ffffff")
         self.cover_photo = None
         self.store: dict = empty_store()
-        self.settings: dict = {}
+        self.settings: dict = {"cover_image": ""}
         self.data_key: bytes | None = None
         self.authenticated = False
+        self.is_admin = False
+        self.permissions: dict[str, bool] = {"view": True, "add": True, "edit": True, "delete": True}
         self._idle_after_id = None
         self.selected_email_person_ids: set[str] = set()
         self._settings_scroll_canvas = None
+        self._update_events: queue.Queue = queue.Queue()
+        self._update_check_started = False
+        self._update_checking = False
+        self._update_checked = False
+        self._update_available_asset: dict | None = None
+        self._update_version = ""
+        self._update_error = ""
+        self._update_manual_check = False
+        self._update_buttons: list[tk.Button] = []
         if ACCOUNT_FILE.exists():
             try:
                 account_meta = json.loads(ACCOUNT_FILE.read_text(encoding="utf-8"))
@@ -264,6 +332,7 @@ class AccountingDemo:
         self.root.bind_all("<Any-KeyPress>", self._on_user_activity, add="+")
         self.root.bind_all("<Any-ButtonPress>", self._on_user_activity, add="+")
         self.root.bind_all("<MouseWheel>", self._scroll_settings_with_wheel, add="+")
+        self.root.after(300, self._process_update_events)
         self.show_login()
 
     def _load_user_data(self) -> None:
@@ -314,6 +383,8 @@ class AccountingDemo:
                 pass
             self._idle_after_id = None
         self.authenticated = False
+        self.is_admin = False
+        self.permissions = {"view": True, "add": True, "edit": True, "delete": True}
         for child in list(self.root.winfo_children()):
             if isinstance(child, tk.Toplevel):
                 try:
@@ -413,10 +484,7 @@ class AccountingDemo:
                     self.cover_photo = ImageTk.PhotoImage(source.convert("RGB"))
             except (OSError, tk.TclError):
                 self.cover_photo = None
-        if self.root.tk.call("tk", "windowingsystem") == "x11":
-            self.root.attributes("-zoomed", True)
-        else:
-            self.root.state("zoomed")
+        self.root.state("zoomed")
         self.root.resizable(True, True)
         self.root.update_idletasks()
         width, height = self.root.winfo_width(), self.root.winfo_height()
@@ -472,7 +540,7 @@ class AccountingDemo:
 
         is_setup = not ACCOUNT_FILE.exists()
         title = "İlk Kullanım" if is_setup else "Güvenli Giriş"
-        ttk.Label(card, text="Basit Ev Muhasebe Programı", style="LoginOrg.TLabel").pack(anchor="center", pady=(0, 14))
+        ttk.Label(card, text="Gelir-Gider Takibi", style="LoginOrg.TLabel").pack(anchor="center", pady=(0, 14))
         ttk.Label(card, text=title, style="LoginTitle.TLabel").pack(anchor="w", pady=(0, 4))
         ttk.Label(card, text="Güvenli kayıt yönetimi", style="LoginText.TLabel").pack(anchor="w", pady=(0, 12))
         ttk.Label(card, text="Kullanıcı adı", style="LoginText.TLabel").pack(anchor="w")
@@ -597,14 +665,27 @@ class AccountingDemo:
         except (OSError, json.JSONDecodeError):
             messagebox.showerror("Giriş", "Kullanıcı dosyası okunamadı.", parent=self.root)
             return
-        username_ok = self.username_entry.get().strip().casefold() == str(record.get("username", "")).casefold()
+        username = self.username_entry.get().strip()
         password = self.password_entry.get()
-        if not username_ok or not password_matches(password, record):
+        is_admin = username.casefold() == str(record.get("username", "")).casefold()
+        subuser = next((item for item in record.get("users", [])
+                        if str(item.get("username", "")).casefold() == username.casefold()), None)
+        credential = record if is_admin else subuser
+        if not username or credential is None or not password_matches(password, credential):
             messagebox.showerror("Giriş başarısız", "Kullanıcı adı veya şifre hatalı.", parent=self.root)
             self.password_entry.delete(0, "end")
             return
+        permissions = {"view": True, "add": True, "edit": True, "delete": True} if is_admin else {
+            name: bool(subuser.get("permissions", {}).get(name, False))
+            for name in ("view", "add", "edit", "delete")
+        }
+        if not permissions["view"]:
+            messagebox.showwarning("Erişim yok", "Bu hesaba kayıtları görüntüleme yetkisi verilmediği için giriş yapılamaz.", parent=self.root)
+            self.password_entry.delete(0, "end")
+            return
         try:
-            data_key = unwrap_data_key(record["data_key_wrap"], password, "password")
+            purpose = "password" if is_admin else f"subuser:{hashlib.sha256(username.casefold().encode('utf-8')).hexdigest()}"
+            data_key = unwrap_data_key(credential["data_key_wrap"], password, purpose)
             self.data_key = data_key
             ACTIVE_DATA_KEY = data_key
             self._load_user_data()
@@ -614,9 +695,97 @@ class AccountingDemo:
             messagebox.showerror("Giriş yapılamadı", f"Şifreli kayıtlar açılamadı; dosyalara dokunulmadı.\n{exc}", parent=self.root)
             return
         self.authenticated = True
+        self.is_admin = is_admin
+        self.permissions = permissions
         self.root.unbind("<Return>")
-        self.show_dashboard(record.get("username", ""))
+        self.show_dashboard(record.get("username", "") if is_admin else subuser.get("username", ""))
         self._schedule_idle_lock()
+
+    def can(self, permission: str) -> bool:
+        return self.is_admin or bool(self.permissions.get(permission, False))
+
+    def require_permission(self, permission: str, action: str) -> bool:
+        if self.can(permission):
+            return True
+        messagebox.showwarning("Yetki gerekli", f"Bu kullanıcıya “{action}” yetkisi verilmemiş.", parent=self.root)
+        return False
+
+    @staticmethod
+    def user_key_purpose(username: str) -> str:
+        return f"subuser:{hashlib.sha256(username.casefold().encode('utf-8')).hexdigest()}"
+
+    def create_authorized_user(self) -> None:
+        if not self.is_admin:
+            messagebox.showwarning("Yetki gerekli", "Yeni kullanıcıyı yalnızca yönetici oluşturabilir.", parent=self.root)
+            return
+        username = simpledialog.askstring("Yetki ver", "Yeni kullanıcının adı:", parent=self.root)
+        if username is None:
+            return
+        username = username.strip()
+        if not username:
+            messagebox.showwarning("Kullanıcı adı", "Bir kullanıcı adı yaz.", parent=self.root)
+            return
+        try:
+            account = json.loads(ACCOUNT_FILE.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            messagebox.showerror("Kullanıcı oluşturulamadı", f"Hesap bilgileri okunamadı.\n{exc}", parent=self.root)
+            return
+        if username.casefold() == str(account.get("username", "")).casefold() or any(
+                username.casefold() == str(item.get("username", "")).casefold() for item in account.get("users", [])):
+            messagebox.showwarning("Kullanıcı adı", "Bu kullanıcı adı zaten kullanılıyor.", parent=self.root)
+            return
+        if len(account.get("users", [])) >= 5:
+            messagebox.showwarning("Kullanıcı sınırı", "En fazla 5 ek kullanıcı oluşturulabilir.", parent=self.root)
+            return
+        password = simpledialog.askstring("Yetki ver", "Bu kullanıcı için en az 8 karakterli şifre:", show="•", parent=self.root)
+        if password is None:
+            return
+        confirmation = simpledialog.askstring("Yetki ver", "Şifreyi tekrar yaz:", show="•", parent=self.root)
+        if confirmation is None:
+            return
+        if len(password) < 8 or password != confirmation:
+            messagebox.showwarning("Şifre", "Şifre en az 8 karakter olmalı ve iki giriş aynı olmalı.", parent=self.root)
+            return
+        permission_dialog = tk.Toplevel(self.root)
+        permission_dialog.title("Yeni kullanıcının yetkileri")
+        permission_dialog.transient(self.root)
+        permission_dialog.resizable(False, False)
+        permission_dialog.configure(bg="white", padx=22, pady=18)
+        tk.Label(permission_dialog, text=f"{username} için izinleri seç", bg="white", fg="#123f76",
+                 font=("Segoe UI", 14, "bold")).pack(anchor="w", pady=(0, 10))
+        permission_vars = {"view": tk.BooleanVar(value=True), "add": tk.BooleanVar(value=True),
+                           "edit": tk.BooleanVar(value=False), "delete": tk.BooleanVar(value=False)}
+        for key, label in (("view", "Kayıtları görüntüleyebilir"), ("add", "Yeni veri girebilir"),
+                           ("edit", "Kayıtları düzeltebilir"), ("delete", "Kayıtları silebilir")):
+            ttk.Checkbutton(permission_dialog, text=label, variable=permission_vars[key]).pack(anchor="w", pady=3)
+        selected_permissions = {"value": None}
+        def accept_permissions() -> None:
+            chosen = {key: bool(variable.get()) for key, variable in permission_vars.items()}
+            if (chosen["add"] or chosen["edit"] or chosen["delete"]) and not chosen["view"]:
+                messagebox.showwarning("Yetki seçimi", "Yeni veri girme, düzeltme veya silme yetkisi için görüntüleme de açık olmalı.", parent=permission_dialog)
+                return
+            selected_permissions["value"] = chosen
+            permission_dialog.destroy()
+        permission_buttons = tk.Frame(permission_dialog, bg="white")
+        permission_buttons.pack(fill="x", pady=(14, 0))
+        self.ice_button(permission_buttons, "Vazgeç", permission_dialog.destroy, fg="#52627a").pack(side="left")
+        self.ice_button(permission_buttons, "Kullanıcıyı oluştur", accept_permissions).pack(side="right")
+        permission_dialog.protocol("WM_DELETE_WINDOW", permission_dialog.destroy)
+        permission_dialog.grab_set()
+        self.root.wait_window(permission_dialog)
+        permissions = selected_permissions["value"]
+        if permissions is None:
+            return
+        user = {"username": username, **password_record(password),
+                "data_key_wrap": wrap_data_key(self.data_key, password, self.user_key_purpose(username)),
+                "permissions": permissions}
+        account.setdefault("users", []).append(user)
+        try:
+            atomic_json_write(ACCOUNT_FILE, account)
+        except (OSError, RuntimeError) as exc:
+            messagebox.showerror("Kullanıcı oluşturulamadı", str(exc), parent=self.root)
+            return
+        messagebox.showinfo("Yetki verildi", f"{username} için giriş hesabı oluşturuldu.\nYetkiler: " + ", ".join(label for key, label in (("view", "Görüntüleme"), ("add", "Yeni kayıt"), ("edit", "Düzeltme"), ("delete", "Silme")) if permissions[key]), parent=self.root)
 
     def forgot_password(self) -> None:
         global ACTIVE_DATA_KEY
@@ -671,7 +840,9 @@ class AccountingDemo:
                                           show="•", parent=self.root)
         if password is None:
             return False
-        if not password_matches(password, record):
+        credential = record if self.is_admin else next((item for item in record.get("users", [])
+                            if str(item.get("username", "")).casefold() == str(getattr(self, "current_username", "")).casefold()), {})
+        if not password_matches(password, credential):
             messagebox.showerror("Şifre hatalı", "Program şifresi doğru değil; işlem yapılmadı.", parent=self.root)
             return False
         return True
@@ -682,7 +853,7 @@ class AccountingDemo:
             self.active_page = "Genel Bakış"
         for child in self.root.winfo_children():
             child.destroy()
-        self.root.title("Basit Ev Muhasebe Programı")
+        self.root.title("Gelir-Gider Takibi")
         self.root.geometry("1584x1000")
         self.root.minsize(1200, 760)
         self.root.resizable(True, True)
@@ -704,7 +875,8 @@ class AccountingDemo:
         self.content = tk.Frame(shell, bg="#f7f9fc")
         self.content.pack(side="left", fill="both", expand=True, padx=20, pady=18)
         self.nav_buttons = {}
-        for label in ("Genel Bakış", "Kategoriler", "Raporlar", "Sabit Bağışçılar", "Bağışçılar", "Kişilerim", "Önemli Kişiler", "Ayarlar"):
+        self._update_buttons = []
+        for label in ("Genel Bakış", "Kategoriler", "Raporlar", "Sabit Bağışçılar", "Bağışçılar", "Kişilerim", "Önemli Kişiler", "Ayarlar", "Güncelle"):
             nav_button = tk.Canvas(side, height=46, bg="#073b7a", highlightthickness=0, bd=0,
                                   cursor="hand2", takefocus=1)
             nav_button._nav_name = label
@@ -713,19 +885,30 @@ class AccountingDemo:
             nav_button.bind("<Configure>", lambda _event, name=label: self._draw_navigation_button(name), add="+")
             nav_button.bind("<Enter>", lambda _event, name=label: self._navigation_hover(name, True), add="+")
             nav_button.bind("<Leave>", lambda _event, name=label: self._navigation_hover(name, False), add="+")
-            nav_button.bind("<Button-1>", lambda _event, name=label: self.show_page(name), add="+")
-            nav_button.bind("<Return>", lambda _event, name=label: self.show_page(name), add="+")
+            if label == "Güncelle":
+                nav_button.bind("<Button-1>", lambda _event: self.on_update_button(), add="+")
+                nav_button.bind("<Return>", lambda _event: self.on_update_button(), add="+")
+            else:
+                nav_button.bind("<Button-1>", lambda _event, name=label: self.show_page(name), add="+")
+                nav_button.bind("<Return>", lambda _event, name=label: self.show_page(name), add="+")
             self.nav_buttons[label] = nav_button
+            if label == "Güncelle":
+                self.update_nav_button = nav_button
 
         head = tk.Frame(self.content, bg="#f7f9fc")
         head.pack(fill="x", pady=(2, 15))
-        tk.Label(head, text="Basit Ev Muhasebe Programı", bg="#f7f9fc", fg="#092554", font=("Segoe UI", 22, "bold")).place(relx=0.5, rely=0.5, anchor="center")
+        tk.Label(head, text="Gelir-Gider Takibi", bg="#f7f9fc", fg="#092554",
+                 font=("Segoe UI", 22, "bold")).pack(anchor="w")
         actions = tk.Frame(head, bg="#f7f9fc")
-        actions.pack(side="right")
-        tk.Button(actions, text="＋ Yeni Gelir", command=lambda: self.open_transaction_form("Gelir"), bg="#08a94e", fg="white", activebackground="#078d41", relief="flat", padx=18, pady=11, font=("Segoe UI", 13, "bold")).pack(side="left", padx=5)
-        tk.Button(actions, text="＋ Yeni Gider", command=lambda: self.open_transaction_form("Gider"), bg="#f04444", fg="white", activebackground="#d93434", relief="flat", padx=18, pady=11, font=("Segoe UI", 13, "bold")).pack(side="left", padx=5)
+        actions.pack(anchor="e", pady=(8, 0))
+        if self.can("add"):
+            _NATIVE_TK_BUTTON(actions, text="＋ Yeni Gelir", command=lambda: self.open_transaction_form("Gelir"), bg="#08a94e", fg="white", activebackground="#078d41", relief="flat", padx=18, pady=11, font=("Segoe UI", 13, "bold")).pack(side="left", padx=5)
+            _NATIVE_TK_BUTTON(actions, text="＋ Yeni Gider", command=lambda: self.open_transaction_form("Gider"), bg="#f04444", fg="white", activebackground="#d93434", relief="flat", padx=18, pady=11, font=("Segoe UI", 13, "bold")).pack(side="left", padx=5)
         tk.Button(actions, text="▣ PDF Yazdır", command=self.export_table_pdf, bg="white", fg="#17325b", relief="solid", bd=1, padx=18, pady=10, font=("Segoe UI", 13, "bold")).pack(side="left", padx=5)
         tk.Button(actions, text="Kilitle", command=self.lock_app, bg="white", fg="#17325b", relief="solid", bd=1, padx=12, pady=10, font=("Segoe UI", 12)).pack(side="left", padx=5)
+        self.update_home_button = tk.Button(actions, text="Güncelle", command=self.on_update_button)
+        self.update_home_button.pack(side="left", padx=5)
+        self._update_buttons.append(self.update_home_button)
 
         cards = tk.Frame(self.content, bg="#f7f9fc")
         cards.pack(fill="x", pady=(0, 17))
@@ -812,7 +995,8 @@ class AccountingDemo:
         self.table_canvas.bind("<MouseWheel>", self.on_table_mousewheel, add="+")
         self.table = None
         self.selected_row_index = None
-        tk.Button(ledger, text="Düzenle seçili kaydı", command=self.edit_selected_transaction, bg="#edf3fb", fg="#17325b", relief="solid", bd=1, padx=12, pady=7).pack(anchor="e", pady=(8, 0))
+        if self.can("edit"):
+            tk.Button(ledger, text="Düzenle seçili kaydı", command=self.edit_selected_transaction, bg="#edf3fb", fg="#17325b", relief="solid", bd=1, padx=12, pady=7).pack(anchor="e", pady=(8, 0))
 
         tk.Label(panel, text="Aylık Toplamlar", bg="white", fg="#122a50", font=("Segoe UI", 17, "bold")).pack(anchor="w", pady=(0, 13))
         self.month_summary_vars = {}
@@ -830,6 +1014,10 @@ class AccountingDemo:
         badge.pack(side="bottom", anchor="e", pady=(12, 0))
         self.refresh_transactions()
         self.enhance_controls(self.root)
+        if hasattr(self, "update_nav_button"):
+            self._refresh_update_buttons()
+        if not self._update_check_started:
+            self.root.after(700, self.check_for_updates)
 
     def _navigation_hover(self, name: str, hovered: bool) -> None:
         button = getattr(self, "nav_buttons", {}).get(name)
@@ -846,8 +1034,13 @@ class AccountingDemo:
         height = max(button.winfo_height(), 46)
         active = name == self.active_page
         hovered = bool(getattr(button, "_nav_hovered", False))
-        fill = "#1680e8" if active else ("#125394" if hovered else "#0b4786")
-        edge = "#b9ddff" if active else ("#5c8fbe" if hovered else "#1b568f")
+        update_available = name == "Güncelle" and self._update_available_asset is not None
+        if update_available:
+            fill = "#159447" if not hovered else "#11783a"
+            edge = "#8ce0a9"
+        else:
+            fill = "#1680e8" if active else ("#125394" if hovered else "#0b4786")
+            edge = "#b9ddff" if active else ("#5c8fbe" if hovered else "#1b568f")
         button.delete("all")
         x1, y1, x2, y2, radius = 2, 2, width - 4, height - 5, 11
 
@@ -863,7 +1056,8 @@ class AccountingDemo:
         button.create_polygon(points, smooth=True, splinesteps=16, fill=fill, outline=edge, width=1)
         if active:
             button.create_line(13, 12, 13, height - 15, fill="#d9edff", width=3, capstyle="round")
-        button.create_text(26 if active else 20, height // 2 - 1, text=name, anchor="w",
+        display_name = f"Güncelle  ·  v{self._update_version}" if update_available else name
+        button.create_text(26 if active else 20, height // 2 - 1, text=display_name, anchor="w",
                            fill="white", font=("Segoe UI", 13, "bold"), width=width - 44)
 
     def _update_navigation_state(self, active_page: str) -> None:
@@ -872,6 +1066,130 @@ class AccountingDemo:
             if not button.winfo_exists():
                 continue
             self._draw_navigation_button(name)
+
+    @staticmethod
+    def _version_tuple(value: str) -> tuple[int, int, int] | None:
+        match = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)", str(value).strip())
+        if not match:
+            return None
+        return tuple(int(part) for part in match.groups())
+
+    def check_for_updates(self) -> None:
+        if self._update_checking:
+            return
+        self._update_check_started = True
+        self._update_checking = True
+        self._update_error = ""
+        self._refresh_update_buttons()
+        threading.Thread(target=self._check_latest_release_worker, daemon=True).start()
+
+    def _check_latest_release_worker(self) -> None:
+        try:
+            if sys.platform == "win32":
+                asset_prefix = "Basit-Ev-Muhasebe-WINDOWS-"
+            elif sys.platform.startswith("linux"):
+                asset_prefix = "Basit-Ev-Muhasebe-LINUX-"
+            else:
+                raise ValueError("Bu işletim sistemi için güncelleme paketi bulunamadı.")
+
+            request = urllib.request.Request(
+                LATEST_RELEASE_API,
+                headers={
+                    "Accept": "application/vnd.github+json",
+                    "User-Agent": f"Basit-Ev-Muhasebe/{APP_VERSION}",
+                    "X-GitHub-Api-Version": "2022-11-28",
+                },
+            )
+            with urllib.request.urlopen(request, timeout=15) as response:
+                payload = response.read(2 * 1024 * 1024 + 1)
+            if len(payload) > 2 * 1024 * 1024:
+                raise ValueError("Güncelleme bilgisi beklenenden büyük.")
+            release = json.loads(payload.decode("utf-8"))
+            tag = str(release.get("tag_name", ""))
+            latest_version = self._version_tuple(tag)
+            current_version = self._version_tuple(APP_VERSION)
+            if latest_version is None or current_version is None:
+                raise ValueError("Sürüm bilgisi okunamadı.")
+            if release.get("draft") or release.get("prerelease"):
+                raise ValueError("Yayımlanmış kararlı sürüm bulunamadı.")
+            if latest_version <= current_version:
+                self._update_events.put(("complete", None, ""))
+                return
+
+            asset = next((item for item in release.get("assets", [])
+                          if str(item.get("name", "")).startswith(asset_prefix)
+                          and str(item.get("name", "")).lower().endswith(".zip")), None)
+            if not asset:
+                raise ValueError("Bu işletim sistemi için yeni sürüm ZIP'i henüz yayımlanmamış.")
+            download_url = str(asset.get("browser_download_url", ""))
+            parsed_url = urllib.parse.urlparse(download_url)
+            if (parsed_url.scheme != "https" or parsed_url.netloc != "github.com"
+                    or not parsed_url.path.startswith("/sarmasaicode/basit-ev-muhasebe/releases/download/")):
+                raise ValueError("Güncelleme bağlantısı doğrulanamadı.")
+            self._update_events.put(("complete", {"asset": asset, "version": tag.lstrip("v")}, ""))
+        except (OSError, ValueError, urllib.error.URLError, json.JSONDecodeError) as exc:
+            self._update_events.put(("complete", None, str(exc)))
+
+    def _process_update_events(self) -> None:
+        try:
+            while True:
+                event, result, error = self._update_events.get_nowait()
+                if event != "complete":
+                    continue
+                self._update_checking = False
+                self._update_checked = True
+                self._update_error = error
+                self._update_available_asset = result["asset"] if result else None
+                self._update_version = result["version"] if result else ""
+                self._refresh_update_buttons()
+                if self._update_manual_check:
+                    if self._update_available_asset is None:
+                        if self._update_error:
+                            messagebox.showinfo("Güncelleme", "Şu an güncelleme alınamadı. İnternet bağlantısını kontrol edip tekrar dene.", parent=self.root)
+                        else:
+                            messagebox.showinfo("Güncelleme", "Program güncel.", parent=self.root)
+                    self._update_manual_check = False
+        except queue.Empty:
+            pass
+        try:
+            if self.root.winfo_exists():
+                self.root.after(250, self._process_update_events)
+        except tk.TclError:
+            return
+
+    def _refresh_update_buttons(self) -> None:
+        available = self._update_available_asset is not None
+        for button in getattr(self, "_update_buttons", []):
+            try:
+                if not button.winfo_exists():
+                    continue
+                if self._update_checking:
+                    button.configure(text="Kontrol ediliyor…", state="disabled")
+                elif available:
+                    button.configure(text=f"Güncelle · v{self._update_version}", state="normal",
+                                     bg="#159447", fg="white", activebackground="#11783a",
+                                     activeforeground="white")
+                else:
+                    button.configure(text="Güncelle", state="normal", bg="#0756bd", fg="white",
+                                     activebackground="#06489e", activeforeground="white")
+            except tk.TclError:
+                continue
+        if getattr(self, "update_nav_button", None) is not None:
+            try:
+                self._draw_navigation_button("Güncelle")
+            except tk.TclError:
+                pass
+
+    def on_update_button(self) -> None:
+        if self._update_available_asset is None:
+            if not self._update_checking:
+                self._update_manual_check = True
+                self.check_for_updates()
+            return
+        url = self._update_available_asset.get("browser_download_url", "")
+        if url and webbrowser.open_new_tab(url):
+            return
+        messagebox.showerror("Güncelleme", "İndirme bağlantısı açılamadı.", parent=self.root)
 
     @staticmethod
     def euro(value: Decimal) -> str:
@@ -1187,7 +1505,7 @@ $doc.add_PrintPage({
     $fmt.Trimming = [System.Drawing.StringTrimming]::EllipsisCharacter
     $fmt.Alignment = [System.Drawing.StringAlignment]::Near
     $fmt.LineAlignment = [System.Drawing.StringAlignment]::Center
-    $g.DrawString('Basit Ev Muhasebe Programı',$titleFont,$blue,$left,($b.Top+2))
+    $g.DrawString('Muhasebe Programı',$titleFont,$blue,$left,($b.Top+2))
     $g.DrawString(([string]$script:pdfData.title + '  ·  ' + [string]$script:pdfData.created),$subFont,$black,$left,($b.Top+32))
     if ($script:pdfData.show_totals) {
         $g.DrawString(('Toplam gelir: ' + [string]$script:pdfData.income),$boldFont,$green,$left,($b.Top+56))
@@ -1257,7 +1575,7 @@ $doc.add_PrintPage({
     $titleFont.Dispose(); $subFont.Dispose(); $headFont.Dispose(); $bodyFont.Dispose(); $boldFont.Dispose(); $green.Dispose(); $red.Dispose(); $paleGreen.Dispose(); $paleRed.Dispose(); $paleBlue.Dispose(); $line.Dispose(); $fmt.Dispose()
 })
 $form = New-Object System.Windows.Forms.Form
-$form.Text = 'A4 Baskı Önizleme — Basit Ev Muhasebe Programı'
+$form.Text = 'A4 Baskı Önizleme — Muhasebe Programı'
 $form.WindowState = [System.Windows.Forms.FormWindowState]::Maximized
 $form.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
 $form.MinimumSize = New-Object System.Drawing.Size(900,650)
@@ -1492,6 +1810,12 @@ if ($script:printError) { throw $script:printError }
         self.refresh_transactions()
 
     def show_page(self, name: str, *, verify_sensitive: bool = True) -> None:
+        if not self.is_admin and name == "Ayarlar":
+            messagebox.showwarning("Yönetici yetkisi", "Ayarlar ve kullanıcı yönetimi yalnızca yöneticiye açıktır.", parent=self.root)
+            return
+        if not self.can("view") and name not in ("Gelirler", "Giderler"):
+            messagebox.showwarning("Görüntüleme yetkisi", "Bu kullanıcıya kayıtları görüntüleme yetkisi verilmemiş.", parent=self.root)
+            return
         if name == "Önemli Kişiler" and verify_sensitive:
             if not self.confirm_account_password("Önemli Kişiler bölümünü açma"):
                 return
@@ -1598,6 +1922,8 @@ if ($script:printError) { throw $script:printError }
         self.enhance_controls(self.content)
 
     def save_important_contact(self) -> None:
+        if not self.require_permission("edit" if self._editing_important_contact_id else "add", "Önemli kişi kaydetme"):
+            return
         values = {key: entry.get().strip() for key, entry in self.important_contact_entries.items()}
         if not values["name"]:
             messagebox.showwarning("Önemli Kişiler", "Kişinin adını veya kurum adını yaz.", parent=self.root)
@@ -1632,6 +1958,8 @@ if ($script:printError) { throw $script:printError }
         self.show_important_contacts()
 
     def edit_selected_important_contact(self) -> None:
+        if not self.require_permission("edit", "Önemli kişi düzeltme"):
+            return
         selected = self.important_contacts_table.selection()
         if not selected or selected[0] == "__empty__":
             messagebox.showinfo("Kişi seçilmedi", "Düzenlemek için listeden bir kişi seç.", parent=self.root)
@@ -1651,6 +1979,8 @@ if ($script:printError) { throw $script:printError }
         self.important_contact_entries["name"].focus_set()
 
     def delete_selected_important_contact(self) -> None:
+        if not self.require_permission("delete", "Önemli kişi silme"):
+            return
         selected = self.important_contacts_table.selection()
         if not selected or selected[0] == "__empty__":
             messagebox.showinfo("Kişi seçilmedi", "Silmek için listeden bir kişi seç.", parent=self.root)
@@ -1683,7 +2013,12 @@ if ($script:printError) { throw $script:printError }
         tk.Label(header, text="Bağışçılar", bg="#f7f9fc", fg="#0b3d79", font=("Segoe UI", 23, "bold")).pack(side="left")
         actions = tk.Frame(header, bg="#f7f9fc")
         actions.pack(side="right")
-        self.ice_button(actions, "＋ Kişilerimden seç", lambda: self.show_people(pick_for="regular")).pack(side="left", padx=5)
+        if self.can("add"):
+            self.ice_button(actions, "＋ Kişilerimden seç", lambda: self.show_people(pick_for="regular")).pack(side="left", padx=5)
+        if self.can("edit"):
+            self.ice_button(actions, "✎ Seçili kişiyi düzelt", self.edit_selected_donor).pack(side="left", padx=5)
+        if self.can("delete"):
+            self.ice_button(actions, "⌫ Sil", self.delete_selected_donor, fg="#bd2934").pack(side="left", padx=5)
         self.ice_button(actions, "▣ Yazdır", self.print_donors).pack(side="left", padx=5)
         tk.Label(self.content, text="Bağışçıların iletişim ve bağış bilgileri", bg="#f7f9fc", fg="#52627a",
                  font=("Segoe UI", 11)).pack(anchor="w", pady=(0, 10))
@@ -1699,7 +2034,7 @@ if ($script:printError) { throw $script:printError }
         table.configure(yscrollcommand=scrollbar.set)
         table.pack(side="left", fill="both", expand=True, padx=8, pady=8)
         scrollbar.pack(side="right", fill="y", pady=8)
-        for donor in self.store.get("donors", []):
+        for donor_index, donor in enumerate(self.store.get("donors", [])):
             person = self.person_by_id(donor.get("person_id"))
             details = person or donor
             amount = donor.get("amount", "")
@@ -1707,11 +2042,136 @@ if ($script:printError) { throw $script:printError }
                 shown_amount = self.euro(Decimal(str(amount))) if amount else "—"
             except InvalidOperation:
                 shown_amount = str(amount)
-            table.insert("", "end", values=(details.get("name", donor.get("name", "")),
+            table.insert("", "end", iid=str(donor_index), values=(details.get("name", donor.get("name", "")),
                                              details.get("address", donor.get("address", "")),
                                              details.get("phone", donor.get("phone", "")),
                                              details.get("email", donor.get("email", "")), shown_amount))
+        self.donors_table = table
         self.enhance_controls(self.content)
+
+    def selected_donor(self, action: str) -> tuple[int, dict] | None:
+        table = getattr(self, "donors_table", None)
+        selection = table.selection() if table else ()
+        if not selection:
+            messagebox.showinfo("Bağışçı seçilmedi", f"{action} için önce listeden bir bağışçı seç.",
+                                parent=self.root)
+            return None
+        try:
+            donor_index = int(selection[0])
+            donor = self.store.get("donors", [])[donor_index]
+        except (ValueError, IndexError):
+            messagebox.showerror("Bağışçı bulunamadı", "Seçilen bağışçı artık listede yok.", parent=self.root)
+            self.show_donors()
+            return None
+        return donor_index, donor
+
+    def edit_selected_donor(self) -> None:
+        if not self.require_permission("edit", "Bağışçı düzeltme"):
+            return
+        selected = self.selected_donor("Düzeltme")
+        if not selected:
+            return
+        _donor_index, donor = selected
+        if not self.confirm_account_password("Bağışçı bağış tutarını düzeltme"):
+            return
+
+        person = self.person_by_id(donor.get("person_id")) or donor
+        window = tk.Toplevel(self.root)
+        window.title("Bağışçı bilgilerini düzelt")
+        window.transient(self.root)
+        window.resizable(False, False)
+        window.configure(bg="white")
+        body = tk.Frame(window, bg="white", padx=24, pady=20)
+        body.pack(fill="both", expand=True)
+        tk.Label(body, text=str(person.get("name", "Bağışçı")), bg="white", fg="#0b3d79",
+                 font=("Segoe UI", 16, "bold")).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 14))
+        tk.Label(body, text="Bağış tutarı (€)", bg="white", fg="#263a59",
+                 font=("Segoe UI", 11, "bold")).grid(row=1, column=0, sticky="w", padx=(0, 14), pady=6)
+        amount_entry = ttk.Entry(body, width=24)
+        amount_entry.grid(row=1, column=1, sticky="w", pady=6)
+        amount_entry.insert(0, str(donor.get("amount", "")))
+
+        def save_amount() -> None:
+            amount_text = amount_entry.get().strip().replace("€", "").replace(" ", "")
+            try:
+                normalized = amount_text.replace(".", "").replace(",", ".") if "," in amount_text else amount_text
+                amount = Decimal(normalized).quantize(Decimal("0.01"))
+                if amount <= 0:
+                    raise InvalidOperation
+            except (ValueError, InvalidOperation):
+                messagebox.showwarning("Tutar geçersiz", "Sıfırdan büyük geçerli bir bağış tutarı gir.",
+                                       parent=window)
+                amount_entry.focus_set()
+                return
+
+            old_amount = donor.get("amount")
+            donor_id = str(donor.get("id", ""))
+            payment_id = f"temporary:{donor_id}:initial" if donor_id else ""
+            linked_transactions = [item for item in self.store.get("transactions", [])
+                                   if payment_id and item.get("donor_payment_id") == payment_id]
+            old_transaction_amounts = [(item, item.get("amount")) for item in linked_transactions]
+            donor["amount"] = format(amount, ".2f")
+            for item in linked_transactions:
+                item["amount"] = format(amount, ".2f")
+            try:
+                atomic_json_write(BOOKS_FILE, self.store)
+            except (OSError, RuntimeError) as exc:
+                if old_amount is None:
+                    donor.pop("amount", None)
+                else:
+                    donor["amount"] = old_amount
+                for item, previous_amount in old_transaction_amounts:
+                    if previous_amount is None:
+                        item.pop("amount", None)
+                    else:
+                        item["amount"] = previous_amount
+                messagebox.showerror("Bağışçı güncellenemedi", str(exc), parent=window)
+                return
+            window.destroy()
+            self.show_donors()
+
+        buttons = tk.Frame(body, bg="white")
+        buttons.grid(row=2, column=0, columnspan=2, sticky="e", pady=(18, 0))
+        self.ice_button(buttons, "Vazgeç", window.destroy).pack(side="left", padx=5)
+        self.ice_button(buttons, "Kaydet", save_amount).pack(side="left", padx=5)
+        window.bind("<Return>", lambda _event: save_amount())
+        window.bind("<Escape>", lambda _event: window.destroy())
+        window.grab_set()
+        amount_entry.focus_set()
+        amount_entry.selection_range(0, "end")
+
+    def delete_selected_donor(self) -> None:
+        if not self.require_permission("delete", "Bağışçı silme"):
+            return
+        selected = self.selected_donor("Silme")
+        if not selected:
+            return
+        donor_index, donor = selected
+        person = self.person_by_id(donor.get("person_id")) or donor
+        name = str(person.get("name", "Bu bağışçı"))
+        donor_id = str(donor.get("id", ""))
+        payment_id = f"temporary:{donor_id}:initial" if donor_id else ""
+        detail = " Bağlı ilk bağış gelir kaydı da silinecek." if payment_id else ""
+        if not messagebox.askyesno("Bağışçıyı sil", f"{name} bağışçı listesinden silinsin mi?{detail}",
+                                   parent=self.root):
+            return
+        if not self.confirm_account_password("Bağışçıyı silme"):
+            return
+
+        old_donors = self.store.get("donors", [])
+        old_transactions = self.store.get("transactions", [])
+        self.store["donors"] = [item for index, item in enumerate(old_donors) if index != donor_index]
+        if payment_id:
+            self.store["transactions"] = [item for item in old_transactions
+                                           if item.get("donor_payment_id") != payment_id]
+        try:
+            atomic_json_write(BOOKS_FILE, self.store)
+        except (OSError, RuntimeError) as exc:
+            self.store["donors"] = old_donors
+            self.store["transactions"] = old_transactions
+            messagebox.showerror("Bağışçı silinemedi", str(exc), parent=self.root)
+            return
+        self.show_donors()
 
     def show_fixed_donors(self, year: int | None = None) -> None:
         year = int(year or getattr(self, "fixed_donors_year", datetime.now().year))
@@ -1724,7 +2184,8 @@ if ($script:printError) { throw $script:printError }
         tk.Label(header, text="Sabit Bağışçılar", bg="#f7f9fc", fg="#0b3d79", font=("Segoe UI", 23, "bold")).pack(side="left")
         actions = tk.Frame(header, bg="#f7f9fc")
         actions.pack(side="right")
-        self.ice_button(actions, "＋ Kişilerimden seç", lambda: self.show_people(pick_for="fixed", year=year)).pack(side="left", padx=5)
+        if self.can("add"):
+            self.ice_button(actions, "＋ Kişilerimden seç", lambda: self.show_people(pick_for="fixed", year=year)).pack(side="left", padx=5)
         self.ice_button(actions, "▣ Yazdır", lambda: self.print_fixed_donors(year)).pack(side="left", padx=5)
 
         controls = tk.Frame(self.content, bg="#f7f9fc")
@@ -1743,20 +2204,24 @@ if ($script:printError) { throw $script:printError }
                                               bg="#f7f9fc", fg="#52627a", font=("Segoe UI", 10))
         self.fixed_selection_label.pack(side="left", padx=4)
         self.ice_button(controls, "×  Ödenmedi", lambda: self.apply_fixed_payment_status("unpaid", year),
-                        fg="#bd2934", font=("Segoe UI", 12, "bold"), padx=16, pady=9).pack(side="right", padx=(6, 0))
+                        font=("Segoe UI", 10, "bold"), padx=16, pady=9).pack(side="right", padx=(6, 0))
         self.ice_button(controls, "✓  Ödendi", lambda: self.apply_fixed_payment_status("paid", year),
-                        fg="#138347", font=("Segoe UI", 12, "bold"), padx=16, pady=9).pack(side="right", padx=(6, 0))
+                        font=("Segoe UI", 10, "bold"), padx=16, pady=9).pack(side="right", padx=(6, 0))
 
         month_names = ("Oca", "Şub", "Mar", "Nis", "May", "Haz", "Tem", "Ağu", "Eyl", "Eki", "Kas", "Ara")
         table_wrap = tk.Frame(self.content, bg="white", highlightbackground="#d7e1ee", highlightthickness=1)
         table_wrap.pack(fill="both", expand=True)
+        month_cell_width = 62
         headings = tk.Frame(table_wrap, bg="#e7f4fc", padx=8, pady=8)
         headings.pack(fill="x")
         tk.Label(headings, text="İsim", width=23, anchor="w", bg="#e7f4fc", fg="#14213d",
-                 font=("Segoe UI", 10, "bold")).pack(side="left", padx=(2, 4))
+                 font=("Segoe UI", 11, "bold")).pack(side="left", padx=(2, 4))
         for month in month_names:
-            tk.Label(headings, text=month, width=5, anchor="center", bg="#e7f4fc", fg="#14213d",
-                     font=("Segoe UI", 9, "bold")).pack(side="left", padx=1)
+            header_cell = tk.Frame(headings, bg="#e7f4fc", width=month_cell_width, height=36)
+            header_cell.pack_propagate(False)
+            header_cell.pack(side="left")
+            tk.Label(header_cell, text=month, anchor="center", bg="#e7f4fc", fg="#14213d",
+                     font=("Segoe UI", 12, "bold")).pack(fill="both", expand=True)
         canvas = tk.Canvas(table_wrap, bg="white", highlightthickness=0)
         scrollbar = ttk.Scrollbar(table_wrap, orient="vertical", command=canvas.yview)
         rows_frame = tk.Frame(canvas, bg="white")
@@ -1769,22 +2234,28 @@ if ($script:printError) { throw $script:printError }
         self.fixed_payment_buttons = {}
         for donor_index, donor in enumerate(self.store.get("fixed_donors", [])):
             row_bg = "#f8fcff" if donor_index % 2 == 0 else "#ffffff"
-            row = tk.Frame(rows_frame, bg=row_bg, padx=8, pady=4)
+            row = tk.Frame(rows_frame, bg=row_bg, padx=0, pady=4)
             row.pack(fill="x")
             tk.Label(row, text=donor.get("name", ""), width=23, anchor="w", bg=row_bg, fg="#14213d",
                      font=("Segoe UI", 11)).pack(side="left", padx=(2, 4))
+            # Shift the complete payment grid right by roughly 3 mm at 200% display scaling.
+            tk.Frame(row, bg=row_bg, width=11, height=1).pack(side="left")
             year_payments = donor.get("payments", {}).get(str(year), {})
             for month_index, month in enumerate(month_names, start=1):
                 status = year_payments.get(str(month_index), "")
                 mark = "✓" if status == "paid" else ("×" if status == "unpaid" else "")
                 color = "#16834a" if status == "paid" else ("#c92b37" if status == "unpaid" else "#395672")
-                cell = self.ice_button(row, mark, lambda idx=donor_index, m=month_index, y=year: self.select_fixed_payment(idx, m, y),
-                                       fg=color, width=5, padx=4, pady=4, font=("Segoe UI", 12, "bold"))
-                # Tiny adjacent month cells flicker when hover colors toggle
-                # under the pointer; keep them visually stable and highlight
-                # only the explicitly selected cell.
+                button_cell = tk.Frame(row, bg=row_bg, width=month_cell_width, height=38)
+                button_cell.pack_propagate(False)
+                button_cell.pack(side="left")
+                cell = _NATIVE_TK_BUTTON(
+                    button_cell, text=mark,
+                    command=lambda idx=donor_index, m=month_index, y=year: self.select_fixed_payment(idx, m, y),
+                    bg="#dff3ff", fg=color, activebackground="#c4e8fa", activeforeground=color,
+                    relief="raised", bd=1, padx=2, pady=2,
+                    font=("Segoe UI", 12, "bold"), cursor="hand2")
                 cell._hover_effect_bound = True
-                cell.pack(side="left", padx=1)
+                cell.pack(fill="both", expand=True, padx=1, pady=2)
                 self.fixed_payment_buttons[(donor_index, month_index)] = cell
         if not self.store.get("fixed_donors", []):
             tk.Label(rows_frame, text="Henüz sabit bağışçı eklenmedi.", bg="white", fg="#52627a",
@@ -1801,6 +2272,9 @@ if ($script:printError) { throw $script:printError }
         self.fixed_selection_label.configure(text=f"Seçili: {donor.get('name', '')} · {month} {year}")
 
     def apply_fixed_payment_status(self, status: str, year: int) -> None:
+        permission = "delete" if status == "unpaid" else "add"
+        if not self.require_permission(permission, "Sabit bağışçı ödeme durumu değiştirme"):
+            return
         selected = getattr(self, "pending_fixed_payment", None)
         if selected is None:
             messagebox.showinfo("Ay seçilmedi", "Önce bağışçının ilgili ay kutusunu seç.", parent=self.root)
@@ -1877,7 +2351,8 @@ if ($script:printError) { throw $script:printError }
                  font=("Segoe UI", 11)).pack(anchor="w", pady=(0, 12))
         actions = tk.Frame(self.content, bg="#f7f9fc")
         actions.pack(fill="x", pady=(0, 12))
-        self.ice_button(actions, "＋ Yeni kişi", lambda: self.open_person_form(pick_for, year)).pack(side="left", padx=(0, 6))
+        if self.can("add"):
+            self.ice_button(actions, "＋ Yeni kişi", lambda: self.open_person_form(pick_for, year)).pack(side="left", padx=(0, 6))
         if pick_for is None:
             self.ice_button(actions, "🔐 Gönderici Gmail hesabı", self.open_sender_gmail).pack(side="left", padx=6)
         self.people_email_button = self.ice_button(actions, "✉ Seçilenlere e-posta (0)", self.email_selected_people,
@@ -1904,6 +2379,8 @@ if ($script:printError) { throw $script:printError }
                 return None
 
             def edit_selected_person() -> None:
+                if not self.require_permission("edit", "Kişi düzeltme"):
+                    return
                 person_id = selected_person_id_for_action("Düzenleme")
                 if not person_id:
                     return
@@ -1912,6 +2389,8 @@ if ($script:printError) { throw $script:printError }
                 self.open_person_form(person_id=person_id)
 
             def remove_selected_person() -> None:
+                if not self.require_permission("delete", "Kişiyi listeden kaldırma"):
+                    return
                 person_id = selected_person_id_for_action("Listeden kaldırma")
                 if not person_id:
                     return
@@ -1944,8 +2423,10 @@ if ($script:printError) { throw $script:printError }
                     return
                 self.show_people(pick_for, year)
 
-            self.ice_button(actions, "✎ Düzenle seçili", edit_selected_person).pack(side="left", padx=6)
-            self.ice_button(actions, "⌫ Kişiyi listeden kaldır", remove_selected_person).pack(side="left", padx=6)
+            if self.can("edit"):
+                self.ice_button(actions, "✎ Düzenle seçili", edit_selected_person).pack(side="left", padx=6)
+            if self.can("delete"):
+                self.ice_button(actions, "Kişiyi sil", remove_selected_person).pack(side="left", padx=6)
         if pick_for:
             return_to = "Sabit Bağışçılar" if pick_for == "fixed" else "Bağışçılar"
             self.ice_button(actions, "← Geri dön", lambda: self.show_page(return_to)).pack(side="right", padx=6)
@@ -2034,6 +2515,9 @@ if ($script:printError) { throw $script:printError }
 
     def open_person_form(self, pick_for: str | None = None, year: int | None = None,
                          person_id: str | None = None) -> None:
+        permission = "edit" if person_id else "add"
+        if not self.require_permission(permission, "Kişi kaydetme"):
+            return
         existing_person = self.person_by_id(person_id) if person_id else None
         for child in self.content.winfo_children():
             child.destroy()
@@ -2055,6 +2539,8 @@ if ($script:printError) { throw $script:printError }
         body.grid_columnconfigure(1, weight=1)
 
         def save_person() -> None:
+            if not self.require_permission("edit" if existing_person else "add", "Kişi kaydetme"):
+                return
             name = entries["name"].get().strip()
             address = entries["address"].get().strip()
             if not name or not address:
@@ -2125,6 +2611,8 @@ if ($script:printError) { throw $script:printError }
             row=6, column=0, columnspan=2, sticky="w", pady=(8, 0))
 
         def save_membership() -> None:
+            if not self.require_permission("add", "Bağışçı kaydı ekleme"):
+                return
             amount_text = amount_entry.get().strip().replace("€", "").replace(" ", "")
             try:
                 normalized = amount_text.replace(".", "").replace(",", ".") if "," in amount_text else amount_text
@@ -2324,20 +2812,24 @@ if ($script:printError) { throw $script:printError }
 
         panel = tk.Frame(settings_body, bg="white", padx=20, pady=12, highlightbackground="#d7e1ee", highlightthickness=1)
         panel.pack(anchor="nw", fill="x")
-        tk.Label(panel, text="A4 yazdırma ve PDF kaydetme", bg="white", fg="#122a50", font=("Segoe UI", 16, "bold")).pack(anchor="w")
+        tk.Label(panel, text="Gönderici Gmail hesabı", bg="white", fg="#122a50",
+                 font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(2, 4))
+        sender_row = tk.Frame(panel, bg="white")
+        sender_row.pack(anchor="w")
+        sender_email_entry = ttk.Entry(sender_row, font=("Segoe UI", 10), width=72)
+        sender_email_entry.insert(0, str(self.settings.get("sender_email", "")))
+        sender_email_entry.pack(side="left", padx=(0, 8))
+        tk.Label(panel, text="Bu adres Google giriş/seçiminde ve Gmail taslağını açarken kullanılır. Şifre programa kaydedilmez.",
+                 bg="white", fg="#52627a", font=("Segoe UI", 9)).pack(anchor="w", pady=(4, 6))
+        tk.Label(panel, text="A4 yazdırma ve PDF kaydetme", bg="white", fg="#122a50",
+                 font=("Segoe UI", 13, "bold")).pack(anchor="w", pady=(4, 0))
         tk.Label(panel,
                  text="PDF yazdırırken bu klasör dosya adı için başlangıç önerisi olur. Kaydetme konumunu Windows’un kendi penceresinde değiştirebilirsin.",
-                 bg="white", fg="#52627a", font=("Segoe UI", 11), wraplength=1120, justify="left").pack(anchor="w", pady=(4, 6))
-        tk.Label(panel, text="Gönderici Gmail hesabı", bg="white", fg="#122a50",
-                 font=("Segoe UI", 12, "bold")).pack(anchor="w", pady=(2, 4))
-        sender_email_entry = ttk.Entry(panel, font=("Segoe UI", 11), width=48)
-        sender_email_entry.insert(0, str(self.settings.get("sender_email", "")))
-        sender_email_entry.pack(anchor="w", fill="x", pady=(0, 6))
-        tk.Label(panel, text="Bu adres Google giriş/seçiminde ve Gmail taslağını açarken kullanılır. Şifre programa kaydedilmez.",
-                 bg="white", fg="#52627a", font=("Segoe UI", 10)).pack(anchor="w", pady=(0, 6))
+                 bg="white", fg="#52627a", font=("Segoe UI", 9), wraplength=1120,
+                 justify="left").pack(anchor="w", pady=(2, 6))
         path_row = tk.Frame(panel, bg="white")
         path_row.pack(fill="x")
-        path_entry = ttk.Entry(path_row, font=("Segoe UI", 11))
+        path_entry = ttk.Entry(path_row, font=("Segoe UI", 10))
         path_entry.insert(0, str(self.settings.get("pdf_directory", Path.home())))
         path_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
         path_buttons = tk.Frame(path_row, bg="white")
@@ -2411,29 +2903,92 @@ if ($script:printError) { throw $script:printError }
                   bg="#e7f1ff", fg="#0b3d79", relief="raised", bd=2, padx=16, pady=8,
                   font=("Segoe UI", 10, "bold"), cursor="hand2").pack(side="left", padx=(0, 8))
 
+        def save_sender_email() -> None:
+            sender_email = sender_email_entry.get().strip()
+            if sender_email and not self.is_valid_email(sender_email):
+                messagebox.showwarning("E-posta adresi geçersiz", "Gönderici için geçerli bir Gmail adresi yaz.", parent=self.root)
+                return
+            previous_email = self.settings.get("sender_email")
+            self.settings["sender_email"] = sender_email
+            try:
+                atomic_json_write(SETTINGS_FILE, self.settings)
+            except OSError as exc:
+                if previous_email is None:
+                    self.settings.pop("sender_email", None)
+                else:
+                    self.settings["sender_email"] = previous_email
+                messagebox.showerror("Mail adresi kaydedilemedi", str(exc), parent=self.root)
+                return
+            messagebox.showinfo("Mail adresi kaydedildi", f"Gönderici Gmail: {sender_email or 'belirtilmedi'}", parent=self.root)
+
+        tk.Button(sender_row, text="Maili Kaydet", command=save_sender_email,
+                  bg="#1680e8", fg="white", relief="raised", bd=2,
+                  padx=14, pady=8, font=("Segoe UI", 10, "bold")).pack(side="left")
+
         def save_location() -> None:
             directory = Path(path_entry.get().strip()).expanduser()
             if not directory.is_dir():
                 messagebox.showwarning("Klasör bulunamadı", "Var olan bir PC veya USB klasörü seç.", parent=self.root)
                 return
-            sender_email = sender_email_entry.get().strip()
-            if sender_email and not self.is_valid_email(sender_email):
-                messagebox.showwarning("E-posta adresi geçersiz", "Gönderici için geçerli bir Gmail adresi yaz.", parent=self.root)
-                return
-            previous = dict(self.settings)
+            previous_directory = self.settings.get("pdf_directory")
             self.settings["pdf_directory"] = str(directory.resolve())
-            self.settings["sender_email"] = sender_email
             try:
                 atomic_json_write(SETTINGS_FILE, self.settings)
             except OSError as exc:
-                self.settings.clear()
-                self.settings.update(previous)
-                messagebox.showerror("Ayar kaydedilemedi", str(exc), parent=self.root)
+                if previous_directory is None:
+                    self.settings.pop("pdf_directory", None)
+                else:
+                    self.settings["pdf_directory"] = previous_directory
+                messagebox.showerror("Konum kaydedilemedi", str(exc), parent=self.root)
                 return
-            messagebox.showinfo("Ayarlar kaydedildi", f"Gönderici Gmail: {sender_email or 'belirtilmedi'}\nPDF klasörü: {directory}", parent=self.root)
+            messagebox.showinfo("Konum kaydedildi", f"PDF klasörü: {directory}", parent=self.root)
 
-        tk.Button(path_buttons, text="Kaydet", command=save_location, bg="#1680e8", fg="white", relief="raised", bd=2,
-                  padx=20, pady=9, font=("Segoe UI", 11, "bold")).pack(side="left")
+        tk.Button(path_buttons, text="Konumu Kaydet", command=save_location, bg="#1680e8", fg="white",
+                  relief="raised", bd=2, padx=14, pady=8,
+                  font=("Segoe UI", 10, "bold")).pack(side="left", padx=(0, 8))
+
+        contact_reset_row = tk.Frame(settings_body, bg="#f7f9fc")
+        contact_reset_row.pack(fill="x", pady=(12, 0))
+
+        contact_panel = tk.Frame(contact_reset_row, bg="white", padx=16, pady=8,
+                                 highlightbackground="#d7e1ee", highlightthickness=1)
+        contact_panel.pack(side="left", fill="both", expand=True, padx=(0, 8))
+        tk.Label(contact_panel, text="Kontak", bg="white", fg="#122a50",
+                 font=("Segoe UI", 14, "bold")).pack(side="left", padx=(0, 20))
+        contact_details = tk.Frame(contact_panel, bg="white")
+        contact_details.pack(side="left", fill="x", expand=True)
+        tk.Label(contact_details, text="Haluk yurduseven", bg="white", fg="#263a59",
+                 font=("Segoe UI", 10, "bold")).pack(side="left")
+        tk.Label(contact_details, text="sarmas.ce@gmail.com", bg="white", fg="#52627a",
+                 font=("Segoe UI", 9)).pack(side="left", padx=(16, 0))
+
+        reset_panel = tk.Frame(contact_reset_row, bg="#fff8f8", padx=14, pady=8,
+                               highlightbackground="#efb8b8", highlightthickness=1)
+        reset_panel.pack(side="left", fill="both", expand=True, padx=(8, 0))
+        tk.Label(reset_panel, text="Tüm program verilerini sıfırla", bg="#fff8f8", fg="#9f1d27",
+                 font=("Segoe UI", 12, "bold")).pack(side="left", anchor="nw", padx=(0, 12))
+        tk.Label(reset_panel,
+                 text="Kişi, bağışçı, ödeme, gelir-gider, kategori ve ayar kayıtları silinir. Giriş hesabı kaldırılır; sıfırlamadan sonra yeni hesap gerekir.",
+                 bg="#fff8f8", fg="#5c4a4a", font=("Segoe UI", 9), wraplength=430,
+                 justify="left").pack(side="left", fill="x", expand=True, anchor="nw")
+        tk.Button(reset_panel, text="🗑  Verileri Sil ve İlk Kuruluma Dön",
+                  command=self.reset_all_program_data, bg="#c83b43", fg="white",
+                  activebackground="#ad2932", activeforeground="white", relief="raised", bd=2,
+                  padx=16, pady=9, font=("Segoe UI", 10, "bold"), cursor="hand2").pack(
+                      side="right", anchor="ne", padx=(12, 0))
+
+        users_panel = tk.Frame(settings_body, bg="#f4f9ff", padx=20, pady=12,
+                               highlightbackground="#c5daf0", highlightthickness=1)
+        users_panel.pack(anchor="nw", fill="x", pady=(10, 0))
+        tk.Label(users_panel, text="Kullanıcı yetkileri", bg="#f4f9ff", fg="#123f76",
+                 font=("Segoe UI", 14, "bold")).pack(anchor="w")
+        tk.Label(users_panel, text="En fazla 5 ek kullanıcı oluştur. Her hesabın görüntüleme, yeni kayıt, düzeltme ve silme yetkilerini yönet; hesabı gerektiğinde kaldır.",
+                 bg="#f4f9ff", fg="#52627a", font=("Segoe UI", 10), wraplength=1120,
+                 justify="left").pack(anchor="w", pady=(4, 8))
+        users_buttons = tk.Frame(users_panel, bg="#f4f9ff")
+        users_buttons.pack(anchor="w")
+        self.ice_button(users_buttons, "＋ Yetki ver / yeni kullanıcı", self.create_authorized_user).pack(side="left", padx=(0, 10))
+        self.ice_button(users_buttons, "Kullanıcıları yönet", self.manage_authorized_users).pack(side="left")
 
         security_panel = tk.Frame(settings_body, bg="#f4f9ff", padx=20, pady=12,
                                   highlightbackground="#c5daf0", highlightthickness=1)
@@ -2467,19 +3022,100 @@ if ($script:printError) { throw $script:printError }
                   bg="#e7f4e9", fg="#24633b", activebackground="#d5ebd9", relief="raised", bd=2,
                   padx=18, pady=9, font=("Segoe UI", 10, "bold"), cursor="hand2").pack(side="left")
 
-        reset_panel = tk.Frame(settings_body, bg="#fff8f8", padx=20, pady=12,
-                               highlightbackground="#efb8b8", highlightthickness=1)
-        reset_panel.pack(anchor="nw", fill="x", pady=(10, 0))
-        tk.Label(reset_panel, text="Tüm program verilerini sıfırla", bg="#fff8f8", fg="#9f1d27",
-                 font=("Segoe UI", 14, "bold")).pack(anchor="w")
-        tk.Label(reset_panel,
-                 text="Kişiler, bağışçılar, ödeme geçmişi, gelir-gider kayıtları, eklenen kategoriler ve ayarlar silinir. Giriş hesabı da kaldırılır; sıfırlamadan sonra yeni kullanıcı adı ve şifre oluşturman gerekir.",
-                 bg="#fff8f8", fg="#5c4a4a", font=("Segoe UI", 10), wraplength=1120,
-                 justify="left").pack(anchor="w", pady=(4, 8))
-        tk.Button(reset_panel, text="🗑  Verileri Sil ve İlk Kuruluma Dön",
-                  command=self.reset_all_program_data, bg="#c83b43", fg="white",
-                  activebackground="#ad2932", activeforeground="white", relief="raised", bd=2,
-                  padx=16, pady=9, font=("Segoe UI", 10, "bold"), cursor="hand2").pack(anchor="w")
+    def manage_authorized_users(self) -> None:
+        if not self.is_admin:
+            messagebox.showwarning("Yetki gerekli", "Kullanıcıları yalnızca yönetici yönetebilir.", parent=self.root)
+            return
+        try:
+            account = json.loads(ACCOUNT_FILE.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            messagebox.showerror("Kullanıcılar", f"Hesap bilgileri okunamadı.\n{exc}", parent=self.root)
+            return
+        users = account.get("users", [])
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Kullanıcıları yönet")
+        dialog.transient(self.root)
+        dialog.geometry("570x390")
+        dialog.configure(bg="white", padx=20, pady=16)
+        tk.Label(dialog, text="Ek kullanıcı hesapları", bg="white", fg="#123f76",
+                 font=("Segoe UI", 16, "bold")).pack(anchor="w", pady=(0, 8))
+        listbox = tk.Listbox(dialog, height=6, exportselection=False, font=("Segoe UI", 11))
+        listbox.pack(fill="x", pady=(0, 12))
+        for user in users:
+            listbox.insert("end", user.get("username", ""))
+        choices = (("view", "Kayıtları görüntüleyebilir"), ("add", "Yeni kayıt ekleyebilir"),
+                   ("edit", "Kayıtları düzeltebilir"), ("delete", "Kayıtları silebilir"))
+        variables = {key: tk.BooleanVar(value=False) for key, _label in choices}
+        flags = tk.Frame(dialog, bg="white")
+        flags.pack(anchor="w", fill="x")
+        for key, label in choices:
+            ttk.Checkbutton(flags, text=label, variable=variables[key]).pack(anchor="w", pady=2)
+        selected_index = {"value": None}
+
+        def select_user(_event=None) -> None:
+            selection = listbox.curselection()
+            if not selection:
+                return
+            index = selection[0]
+            selected_index["value"] = index
+            permissions = users[index].get("permissions", {})
+            for key, _label in choices:
+                variables[key].set(bool(permissions.get(key, False)))
+
+        listbox.bind("<<ListboxSelect>>", select_user)
+
+        def save_permissions() -> None:
+            index = selected_index["value"]
+            if index is None or index >= len(users):
+                messagebox.showinfo("Kullanıcı seç", "Önce listedeki kullanıcıyı seç.", parent=dialog)
+                return
+            if not self.confirm_account_password("kullanıcı yetkilerini değiştirme"):
+                return
+            selected = {key: bool(var.get()) for key, var in variables.items()}
+            if (selected["add"] or selected["edit"] or selected["delete"]) and not selected["view"]:
+                messagebox.showwarning("Yetki seçimi", "Yeni veri girme, düzeltme veya silme yetkisi için görüntüleme de açık olmalı.", parent=dialog)
+                return
+            old = dict(users[index].get("permissions", {}))
+            users[index]["permissions"] = selected
+            try:
+                atomic_json_write(ACCOUNT_FILE, account)
+            except (OSError, RuntimeError) as exc:
+                users[index]["permissions"] = old
+                messagebox.showerror("Yetkiler kaydedilemedi", str(exc), parent=dialog)
+                return
+            messagebox.showinfo("Yetkiler kaydedildi", f"{users[index].get('username')} kullanıcısının yetkileri güncellendi.", parent=dialog)
+
+        def delete_user() -> None:
+            index = selected_index["value"]
+            if index is None or index >= len(users):
+                messagebox.showinfo("Kullanıcı seç", "Önce kaldırılacak kullanıcıyı seç.", parent=dialog)
+                return
+            username = str(users[index].get("username", ""))
+            if not messagebox.askyesno("Kullanıcı hesabını sil", f"{username} hesabı kaldırılsın mı? Bu işlem onun girişini kapatır.", parent=dialog):
+                return
+            if not self.confirm_account_password("kullanıcı hesabını silme"):
+                return
+            removed = users.pop(index)
+            try:
+                atomic_json_write(ACCOUNT_FILE, account)
+            except (OSError, RuntimeError) as exc:
+                users.insert(index, removed)
+                messagebox.showerror("Hesap silinemedi", str(exc), parent=dialog)
+                return
+            listbox.delete(index)
+            selected_index["value"] = None
+            for variable in variables.values():
+                variable.set(False)
+            messagebox.showinfo("Hesap silindi", f"{username} hesabı kaldırıldı. Kayıtlar korunuyor.", parent=dialog)
+
+        actions = tk.Frame(dialog, bg="white")
+        actions.pack(fill="x", pady=(16, 0))
+        self.ice_button(actions, "Yetkileri kaydet", save_permissions).pack(side="left")
+        self.ice_button(actions, "Hesabı sil", delete_user, fg="#bd2934").pack(side="left", padx=8)
+        self.ice_button(actions, "Kapat", dialog.destroy).pack(side="right")
+        if users:
+            listbox.selection_set(0)
+            select_user()
 
     def change_password(self) -> None:
         if self.data_key is None or not self.authenticated:
@@ -2592,7 +3228,7 @@ if ($script:printError) { throw $script:printError }
                     archive.write(path, path.relative_to(APP_DIR))
                 archive.writestr(
                     "yedek-bilgisi.txt",
-                    f"Basit Ev Muhasebe Programı\nSürüm: {APP_VERSION}\n"
+                    f"Muhasebe Programı\nSürüm: {APP_VERSION}\n"
                     f"Yedek zamanı: {datetime.now().isoformat(timespec='seconds')}\n"
                     "Bu yedek kişi ve mali kayıtların yanı sıra giriş hesabı doğrulama dosyasını içerir.\n",
                 )
@@ -2804,6 +3440,8 @@ if ($script:printError) { throw $script:printError }
         self.show_login()
 
     def delete_category(self, category: str) -> None:
+        if not self.require_permission("delete", "Kategori silme"):
+            return
         if not messagebox.askyesno("Kategoriyi sil", f"“{category}” kategorisini seçeneklerden silmek istiyor musun?\n\nEski işlemlerdeki kayıtlı kategori adı korunur."):
             return
         categories = self.store.setdefault("categories", [])
@@ -2818,6 +3456,8 @@ if ($script:printError) { throw $script:printError }
         self.show_page("Kategoriler")
 
     def open_transaction_form(self, transaction_type: str, existing: dict | None = None) -> None:
+        if not self.require_permission("edit" if existing else "add", "Gelir-gider kaydı düzenleme" if existing else "Gelir-gider kaydı ekleme"):
+            return
         form = self.content
         for child in form.winfo_children():
             child.destroy()
@@ -2845,6 +3485,8 @@ if ($script:printError) { throw $script:printError }
         description.grid(row=4, column=1, padx=(12, 0), pady=5)
 
         def save() -> None:
+            if not self.require_permission("edit" if existing else "add", "Gelir-gider kaydı kaydetme"):
+                return
             try:
                 datetime.strptime(day.get().strip(), "%Y-%m-%d")
                 raw = amount_entry.get().strip().replace("€", "").replace(" ", "")
@@ -2881,6 +3523,8 @@ if ($script:printError) { throw $script:printError }
         self.enhance_controls(form)
 
     def edit_selected_transaction(self) -> None:
+        if not self.require_permission("edit", "Gelir-gider kaydı düzenleme"):
+            return
         index = getattr(self, "selected_row_index", None)
         if index is None:
             messagebox.showinfo("Kayıt seç", "Düzenlemek için tablodan bir işlem seç.")
@@ -2894,12 +3538,16 @@ if ($script:printError) { throw $script:printError }
         return None
 
     def add_category(self) -> None:
+        if not self.require_permission("add", "Kategori ekleme"):
+            return
         for child in self.content.winfo_children():
             child.destroy()
         tk.Label(self.content, text="Yeni Kategori", bg="white", fg="#0b3d79", font=("Segoe UI", 21, "bold")).pack(anchor="w", pady=12)
         entry = ttk.Entry(self.content, width=36)
         entry.pack(anchor="w", pady=10)
         def save_category() -> None:
+            if not self.require_permission("add", "Kategori ekleme"):
+                return
             value = entry.get().strip()
             if not value:
                 messagebox.showwarning("Kategori", "Kategori adı yaz.")
@@ -3196,6 +3844,8 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
 
 
 
