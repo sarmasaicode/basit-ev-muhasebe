@@ -1,4 +1,4 @@
-# Ücretsiz Gelir Gider Takip Programı
+# Bağış ve Muhasebe
 
 Windows ve Linux için ücretsiz, kişisel gelir-gider ve bütçe takip uygulaması. Gelir ve giderleri izler; fatura, fiş veya şirket muhasebesi işlemleri yapmaz.
 
